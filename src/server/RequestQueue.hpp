@@ -1,135 +1,121 @@
-#include "common/config.hpp"
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <filesystem>
+#pragma once
 
-struct ClientArgs {
-    std::string command;
-    std::string target;
-    std::string config_path = "config.json";
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
+#include <queue>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "server/Request.hpp"
+
+enum class SchedulingPolicy {
+    FCFS,
+    SJF
 };
 
-ClientArgs parseClientArgs(int argc, char* argv[]) {
-    if (argc < 3) throw std::runtime_error("error: invalid client arguments (usage: client <put|get> <target> [--config <path>])");
-    ClientArgs args;
-    args.command = argv[1];
-    args.target = argv[2];
-    for (int i = 3; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--config" && i + 1 < argc) {
-            args.config_path = argv[++i];
+class RequestQueue {
+private:
+    std::queue<RequestPtr> queue_;
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+
+    bool shutdown_ = false;
+
+    SchedulingPolicy policy_;
+
+public:
+    explicit RequestQueue(SchedulingPolicy policy)
+        : policy_(policy) {}
+
+    void push(const RequestPtr& request) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            if (shutdown_) {
+                return;
+            }
+
+            queue_.push(request);
         }
+
+        cv_.notify_one();
     }
-    return args;
-}
 
-int connectToServer(const std::string& ip, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(ip.c_str());
-    addr.sin_port = htons(port);
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock);
-        return -1;
-    }
-    return sock;
-}
+    RequestPtr pop() {
+        std::unique_lock<std::mutex> lock(mutex_);
 
-int main(int argc, char* argv[]) {
-    try {
-        ClientArgs args = parseClientArgs(argc, argv);
-        ServerConfig cfg = loadServerConfig(args.config_path);
+        cv_.wait(lock, [this]() {
+            return !queue_.empty() || shutdown_;
+        });
 
-        if (args.command == "put") {
-            std::ifstream ifs(args.target, std::ios::binary | std::ios::ate);
-            if (!ifs.is_open()) {
-                std::cerr << "error: cannot open local file '" << args.target << "'\n";
-                return 1;
-            }
-            size_t size = ifs.tellg();
-            ifs.seekg(0);
-
-            std::filesystem::path p(args.target);
-            std::string basename = p.filename().string();
-
-            int sock = connectToServer(cfg.ip, cfg.port);
-            if (sock < 0) {
-                std::cerr << "error: failed to connect to server\n";
-                return 1;
-            }
-
-            std::string req = "PUT " + basename + " " + std::to_string(size) + "\n";
-            send(sock, req.c_str(), req.size(), 0);
-
-            char buf[256];
-            recv(sock, buf, sizeof(buf), 0); // OK 0
-
-            std::vector<char> file_buf(size);
-            ifs.read(file_buf.data(), size);
-            send(sock, file_buf.data(), size, 0);
-            recv(sock, buf, sizeof(buf), 0); // OK 0
-            close(sock);
-
-            std::cout << "[PUT Success] Uploaded " << basename << " (" << size << " bytes)\n";
-        } else if (args.command == "get") {
-            int sock = connectToServer(cfg.ip, cfg.port);
-            if (sock < 0) {
-                std::cerr << "error: failed to connect to server\n";
-                return 1;
-            }
-
-            std::string req = "GET " + args.target + "\n";
-            send(sock, req.c_str(), req.size(), 0);
-
-            char buf[4096];
-            ssize_t n = recv(sock, buf, sizeof(buf), 0);
-            if (n <= 0) {
-                std::cerr << "error: empty response from server\n";
-                close(sock);
-                return 1;
-            }
-
-            std::string resp(buf, n);
-            if (resp.rfind("ERR", 0) == 0) {
-                std::cerr << resp;
-                close(sock);
-                return 1;
-            }
-
-            size_t newline_pos = resp.find('\n');
-            size_t file_size = std::stoull(resp.substr(3, newline_pos - 3));
-
-            std::ofstream ofs(args.target, std::ios::binary);
-            size_t written = 0;
-            size_t initial_body_sz = n - (newline_pos + 1);
-            if (initial_body_sz > 0) {
-                ofs.write(buf + newline_pos + 1, initial_body_sz);
-                written += initial_body_sz;
-            }
-
-            while (written < file_size) {
-                ssize_t r = recv(sock, buf, sizeof(buf), 0);
-                if (r <= 0) break;
-                ofs.write(buf, r);
-                written += r;
-            }
-            close(sock);
-
-            std::cout << "[GET Success] Downloaded " << args.target << " (" << file_size << " bytes)\n";
-        } else {
-            std::cerr << "error: unknown command '" << args.command << "' (use 'put' or 'get')\n";
-            return 1;
+        if (queue_.empty()) {
+            return nullptr;
         }
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << std::endl;
-        return 1;
+
+        RequestPtr selected;
+
+        if (policy_ == SchedulingPolicy::FCFS) {
+            // FCFS = first request that entered the queue
+            selected = queue_.front();
+            queue_.pop();
+        }
+        else if (policy_ == SchedulingPolicy::SJF) {
+            // Find the request with the smallest byte count.
+            //
+            // std::queue does not allow arbitrary removal, so copy
+            // everything into a temporary vector.
+            std::vector<RequestPtr> requests;
+
+            while (!queue_.empty()) {
+                requests.push_back(queue_.front());
+                queue_.pop();
+            }
+
+            std::size_t best_index = 0;
+
+            for (std::size_t i = 1; i < requests.size(); ++i) {
+                if (requests[i]->bytes < requests[best_index]->bytes) {
+                    best_index = i;
+                }
+            }
+
+            selected = requests[best_index];
+
+            // Put all other requests back in their original order.
+            for (std::size_t i = 0; i < requests.size(); ++i) {
+                if (i != best_index) {
+                    queue_.push(requests[i]);
+                }
+            }
+        }
+
+        return selected;
     }
-    return 0;
-}
+
+    std::size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            shutdown_ = true;
+        }
+
+        cv_.notify_all();
+    }
+
+    bool isShutdown() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return shutdown_;
+    }
+};

@@ -33,6 +33,44 @@ bool sendAll(int socket_fd, const void* data, std::size_t len) {
     return true;
 }
 
+bool recvAll(
+    int socket_fd,
+    void* data,
+    std::size_t len) {
+
+    char* buffer =
+        static_cast<char*>(data);
+
+    std::size_t total_received = 0;
+
+    while (total_received < len) {
+
+        ssize_t received = recv(
+            socket_fd,
+            buffer + total_received,
+            len - total_received,
+            0);
+
+        if (received < 0) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return false;
+        }
+
+        if (received == 0) {
+            return false;
+        }
+
+        total_received +=
+            static_cast<std::size_t>(received);
+    }
+
+    return true;
+}
+
 bool recvLine(int socket_fd, std::string& line) {
     line.clear();
 

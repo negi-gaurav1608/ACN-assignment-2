@@ -1,1 +1,26 @@
+# Executables
+server
+client
+
+# Object files
+*.o
+*.obj
+
+# Dependency files
+*.d
+
+# Build directories
+build/
+bin/
+
+# Runtime files
+metrics.csv
+
+# Temporary/editor files
+*.tmp
+*.swp
+*~
+.vscode/
+.idea/
+
 assignment2.pdf
